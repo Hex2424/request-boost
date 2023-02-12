@@ -10,25 +10,25 @@ import json
 import queue
 from datetime import datetime
 from threading import Thread
-from urllib import parse, request
+import socks
 
 
 def boosted_requests(
-    urls,
+    domain,
     no_workers=32,
     max_tries=5,
     timeout=10,
-    headers=None,
-    data=None,
+    proxies = [],
     verbose=True,
     parse_json=True,
 ):
     """
     Get data from APIs in parallel by creating workers that process in the background
-    :param urls: list of URLS
+    :param url: testing url
     :param no_workers: maximum number of parallel processes {Default::32}
     :param max_tries: Maximum number of tries before failing for a specific URL {Default::5}
     :param timeout: Waiting time per request {Default::10}
+    :param proxies: List of proxies IPs to use for each request
     :param headers: Headers if any for the URL requests
     :param data: data if any for the URL requests (Wherever not None a POST request is made)
     :param verbose: Show progress [True or False] {Default::True}
@@ -63,6 +63,7 @@ def boosted_requests(
             self.timeout = timeout
             self.verbose = verbose
             self.parse_json = parse_json
+            self.socketukas = None
 
         def run(self):
             while True:
@@ -72,60 +73,46 @@ def boosted_requests(
                     break
                 else:
                     content = self.queue.get()
-                    url = content["url"]
-                    header = content["header"]
+                    proxy = content["proxy"]
                     num_tries = content["retry"]
-                    data = content["data"]
                     loc = content["loc"]
-                    assert (
-                        num_tries < self.max_tries
-                    ), f"Maximum number of attempts reached {self.max_tries} for {content}"
+                    if num_tries >= self.max_tries:
+                        return
                 try:
-                    if data is not None:
-                        data = parse.urlencode(data).encode()
-                        _request = request.Request(url, data=data)
-                    else:
-                        _request = request.Request(url)
-                    for k, v in header.items():
-                        _request.add_header(k, v)
-                    response = request.urlopen(_request, timeout=self.timeout)
+                    # print(proxy)
+                    self.socketukas = socks.socksocket()
+                    self.socketukas.set_proxy(*proxy)
+                    self.socketukas.settimeout(timeout)
+                    self.socketukas.connect((domain, 80))
+                    print("Connected")
+                    self.socketukas.send(bytes(f"GET / HTTP/1.1\r\nHost:{domain}\r\n\r\n", encoding='utf8'))
+                    response = self.socketukas.recv(16)
+
                 except Exception as exp:
+                    # print(exp)
+                    self.socketukas.close()
                     content["retry"] += 1
                     self.queue.put(content)
                     continue
-                if response.getcode() == 200:
-                    data = response.read()
-                    encoding = response.info().get_content_charset("utf-8")
-                    decoded_data = data.decode(encoding)
-                    self.results[loc] = (
-                        json.loads(decoded_data) if self.parse_json else decoded_data
-                    )
+
+                code = response.split()[1]
+                self.socketukas.close()
+
+                if code == b"200":
+                    self.results[loc] = response
                     self.queue.task_done()
                 else:
+                    print(code)
                     content["retry"] += 1
                     self.queue.put(content)
 
-    if headers is None:
-        headers = [{} for _ in range(len(urls))]
-    if data is None:
-        data = [None for _ in range(len(urls))]
-
-    assert len(headers) == len(
-        urls
-    ), "Length of headers and urls need to be same OR headers needs to be None"
-    assert len(data) == len(
-        urls
-    ), "Length of data and urls need to be same OR data needs to be None (in case of GET)"
-
     url_q = queue.Queue()
-    for i in range(len(urls)):
+    for i in range(len(proxies)):
         url_q.put(
             {
-                "url": urls[i],
+                "proxy" : proxies[i],
                 "retry": 0,
-                "header": headers[i],
-                "loc": i,
-                "data": data[i],
+                "loc": i
             }
         )
 
@@ -150,4 +137,4 @@ def boosted_requests(
         ret.update(worker.results)
     if verbose:
         _printer(f">> DONE")
-    return [ret.get(_) for _ in range(len(urls))]
+    return [ret.get(_) for _ in range(len(proxies))]
